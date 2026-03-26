@@ -11,3 +11,6 @@ git push
 git add token.pickle
 git commit -m "Update token.pickle after re-authentication"
 git push
+git add .
+git commit -m "Clean up deployment config"
+git push
