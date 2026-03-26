@@ -1,0 +1,273 @@
+# Moccasin.ph LROS Bot – Multi-User with Profiles (Simplified)
+import sqlite3
+import logging
+from datetime import datetime
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+from openai import OpenAI
+
+
+import os
+
+# =================== CONFIG ===================
+TELEGRAM_TOKEN = os.environ.get('8395136153:AAH_ENfSu1D_MmiypO_8L4_xmjQYysjh_G0')
+DEEPSEEK_API_KEY = os.environ.get('sk-6fce04ce90a9461fa1181a9a54620273')
+GOOGLE_SHEET_ID = os.environ.get('1SKyjatKl_y697NI3mh21S0CpA69tYIK0qGhAhbNcJp0')
+ADMIN_USER_ID = os.environ.get('@moccasinph_justinebot', 'Moccasin.ph Assistant')
+# ===============================================
+
+# Conversation states for registration flow
+NAME, ROLE, ORGANIZATION = range(3)
+
+# Setup logging
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logger = logging.getLogger(__name__)   # <-- fixed: removed 92
+
+# DeepSeek client
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com/v1")
+
+# Google Sheets setup
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = Credentials.from_service_account_file("service_account.json", scopes=scope)
+gc = gspread.authorize(creds)
+
+# Database setup (SQLite)
+conn = sqlite3.connect("moccasin_users.db", check_same_thread=False)
+c = conn.cursor()
+c.execute('''CREATE TABLE IF NOT EXISTS users
+             (telegram_id INTEGER PRIMARY KEY, 
+              name TEXT, 
+              role TEXT, 
+              organization TEXT,
+              registered_date TEXT)''')
+conn.commit()
+
+def get_user(telegram_id):
+    c.execute("SELECT name, role, organization FROM users WHERE telegram_id=?", (telegram_id,))
+    return c.fetchone()
+
+def save_user(telegram_id, name, role, organization):
+    registered_date = datetime.now().isoformat()
+    c.execute("INSERT OR REPLACE INTO users VALUES (?,?,?,?,?)", 
+              (telegram_id, name, role, organization, registered_date))
+    conn.commit()
+    logger.info(f"New user registered: {name} ({role}) at {organization}")
+
+async def log_to_sheets(user_id, name, role, org, user_msg, ai_msg):
+    """Append a row to the Google Sheet."""
+    try:
+        sheet = gc.open_by_key("1SKyjatKl_y697NI3mh21S0CpA69tYIK0qGhAhbNcJp0").sheet1
+        timestamp = datetime.now().isoformat()
+        sheet.append_row([timestamp, str(user_id), name, role, org, user_msg, ai_msg])
+        logger.info(f"Logged conversation for {name}")
+    except Exception as e:
+        logger.error(f"Logging error: {e}")
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    
+    if user:
+        name, role, org = user
+        welcome = f"👋 Welcome back, **{name}**!\nRole: {role}\nOrganization: {org}\n\n"
+        if role.lower() == "customer":
+            welcome += "How can I help you with your Moccasin.ph shoes today?"
+        elif role.lower() in ["admin", "team", "support"]:
+            welcome += "You have access to internal commands. Use /stats for team metrics."
+        else:
+            welcome += "How can I help you today?"
+        
+        await update.message.reply_text(welcome, parse_mode="Markdown")
+        return ConversationHandler.END
+    else:
+        await update.message.reply_text(
+            "👋 Welcome to **Moccasin.ph Assistant**!\n\n"
+            "I don't have you in my system yet. Let's set up your profile quickly.\n\n"
+            "**What's your full name?**"
+        )
+        return NAME
+
+async def get_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['name'] = update.message.text
+    await update.message.reply_text(
+        "Thanks! **What is your role?**\n(e.g., customer, team, admin, support)"
+    )
+    return ROLE
+
+async def get_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data['role'] = update.message.text
+    await update.message.reply_text(
+        "Great! **What organization are you with?**\n(e.g., Moccasin.ph, or your company name)"
+    )
+    return ORGANIZATION
+
+async def get_organization(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    name = context.user_data['name']
+    role = context.user_data['role']
+    org = update.message.text
+    
+    save_user(user_id, name, role, org)
+    
+    await update.message.reply_text(
+        f"✅ **Profile saved successfully!**\n\n"
+        f"**Name:** {name}\n"
+        f"**Role:** {role}\n"
+        f"**Organization:** {org}\n\n"
+        f"You're now registered. How can I help you today?"
+    )
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Registration cancelled. Send /start to try again.")
+    return ConversationHandler.END
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+    
+    if not user:
+        await update.message.reply_text("❌ You need to register first. Send /start to begin.")
+        return
+
+    name, role, org = user
+    user_message = update.message.text
+
+    # Show typing indicator
+    await update.message.chat.send_action(action="typing")
+
+    # Role-specific prompt
+    if role.lower() == "customer":
+        prompt = f"""You are a helpful customer service assistant for **Moccasin.ph**, an online shoe store.
+
+Customer: {name}
+Organization: {org}
+
+Your responses should be:
+- Friendly and helpful
+- Focused on shoe products, sizing, orders, returns, and general customer service
+- Concise and professional
+
+Answer the customer's question based on this context."""
+
+    elif role.lower() in ["admin", "team", "support"]:
+        prompt = f"""You are an internal assistant for the **Moccasin.ph team**.
+
+Team Member: {name}
+Role: {role}
+
+You have access to help with:
+- Customer inquiries and issue resolution
+- Order tracking and management
+- Inventory questions
+- Team coordination
+
+Answer professionally and helpfully."""
+
+    else:
+        prompt = f"""You are a helpful assistant for {name}, who works as a {role} at {org}."""
+
+    try:
+        response = client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": user_message}
+            ],
+            temperature=0.3,
+            max_tokens=800
+        )
+        ai_response = response.choices[0].message.content
+	# Send response to user
+        await update.message.reply_text(ai_response)
+
+         # Log to Google Sheets
+        await log_to_sheets(user_id, name, role, org, user_message, ai_response)
+
+    except Exception as e:
+	error_msg = f"Sorry, an error occurred: {str(e)}"
+        await update.message.reply_text(error_msg)
+        logger.error(f"API Error for user {name}: {e}")
+
+async def profile_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    if user:
+        name, role, org = user
+        await update.message.reply_text(
+            f"👤 **Your Profile**\n\nName: {name}\nRole: {role}\nOrganization: {org}",
+            parse_mode="Markdown"
+        )
+    else:
+        await update.message.reply_text("You haven't registered yet. Send /start to register.")
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user = get_user(user_id)
+
+    if not user or user[1].lower() not in ["admin", "team"]:
+        await update.message.reply_text("⛔ Not authorized.")
+        return
+
+    # Get user count
+    c.execute("SELECT COUNT(*) FROM users")
+    user_count = c.fetchone()[0]
+
+    # Get role breakdown
+    c.execute("SELECT role, COUNT(*) FROM users GROUP BY role")
+    role_stats = c.fetchall()
+    
+    stats_msg = f"📊 **Statistics**\nTotal Users: {user_count}\n\nBy Role:\n"
+    for role, count in role_stats:
+        stats_msg += f"• {role}: {count}\n"
+    
+await update.message.reply_text(stats_msg, parse_mode="Markdown")
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+ """Show help message."""
+    help_text = """
+**Moccasin.ph Bot Commands**
+
+/start - Register or start the bot
+/profile - View your profile
+/stats - (Team only) Show user statistics
+/help - Show this help message
+
+For customers: Just ask me anything about shoes, orders, sizing, etc.
+For team members: Additional commands may be available.
+    """
+
+    await update.message.reply_text(help_text, parse_mode="Markdown")
+
+def main():
+ """Start the bot."""
+    # Create application
+    app = Application.builder().token(TELEGRAM_TOKEN).build()  
+
+
+    # Registration conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_name)],
+            ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_role)],
+            ORGANIZATION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_organization)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+
+     # Add handlers
+    app.add_handler(conv_handler)
+    app.add_handler(CommandHandler("profile", profile_command))
+    app.add_handler(CommandHandler("stats", stats_command))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # Start bot
+    print("🤖 Moccasin.ph LROS Bot is running...")
+    print("Press Ctrl+C to stop")
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
