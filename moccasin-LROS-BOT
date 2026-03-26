@@ -1,6 +1,6 @@
 git init
 git add .
-git commit -m "Initial Moccasin.ph LROS bot"
+git commit -m ""Switch to OAuth 2.0 for Google Sheets""
 git branch -M main
 git remote add origin https://github.com/yourusername/moccasin-lros-bot.git
 git push -u origin main
