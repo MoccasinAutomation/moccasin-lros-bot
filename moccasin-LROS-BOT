@@ -4,3 +4,6 @@ git commit -m ""Switch to OAuth 2.0 for Google Sheets""
 git branch -M main
 git remote add origin https://github.com/yourusername/moccasin-lros-bot.git
 git push
+git add token.pickle
+git commit -m "Update token.pickle after re-authentication"
+git push
